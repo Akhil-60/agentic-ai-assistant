@@ -9,13 +9,6 @@ An advanced Agentic AI platform designed to perform intelligent reasoning, auton
 - Hugging Face Repository: https://huggingface.co/spaces/akhil060/akhil-ai-agent
 - Live Application: https://akhil060-akhil-ai-agent.hf.space
 
-## Screenshots
-
-![Homepage](assets/homepage.png)
-![Chat Demo](assets/chat-demo.png)
-<img width="766" height="458" alt="Screenshot 2026-06-14 005126" src="https://github.com/user-attachments/assets/055e927d-4ddb-437f-be5d-c4c1868a260e" />
-
-
 ## 🚀 Overview
 
 Agentic AI Assistant is a full-featured AI system that combines Large Language Models (LLMs), Retrieval-Augmented Generation (RAG), Long-Term Memory, Document Intelligence, Vision Analysis, Voice Interaction, and Automation Tools into a unified platform.
