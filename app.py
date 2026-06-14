@@ -359,9 +359,10 @@ def deep_research(topic):
     return "\n\n---\n\n".join(briefs)
 
 def open_website(url):
+    if sync_playwright is None:
+        return "Playwright install nahi hai."
     try:
-        if sync_playwright is None:
-            return "Playwright install nahi hai."
+        with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             page.goto(url)
@@ -372,9 +373,10 @@ def open_website(url):
         return str(e)
 
 def browser_search(url):
+    if sync_playwright is None:
+        return "Playwright install nahi hai."
     try:
-        if sync_playwright is None:
-            return "Playwright install nahi hai."
+        with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             page.goto(url)
@@ -861,6 +863,32 @@ tools = [
         "parameters": {"type": "object", "properties": {
             "job_description": {"type": "string", "description": "Job description ya role requirements"}},
             "required": ["job_description"]}}},
+
+    {"type": "function", "function": {
+        "name": "knowledge_search",
+        "description": "Upload kiye gaye documents (RAG) me se relevant content dhoondta hai. Jab user ne PDF/docx/xlsx upload kiya ho aur usi ke baare me poochhe.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Documents me kya dhoondna hai"}}, "required": ["query"]}}},
+
+    {"type": "function", "function": {
+        "name": "smart_memory_search",
+        "description": "User ki long-term memory (name, interests, projects, preferences, facts) me search. Jab pichhli yaad rakhi gayi baat chahiye.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Memory me kya dhoondna hai"}}, "required": ["query"]}}},
+
+    {"type": "function", "function": {
+        "name": "summarize_meeting",
+        "description": "Meeting transcript ka summary, key decisions aur action items banata hai.",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string", "description": "Meeting ka transcript text"}}, "required": ["text"]}}},
+
+    {"type": "function", "function": {
+        "name": "add_event",
+        "description": "Calendar event save karta hai. Jab user koi reminder/event/schedule add karne ko bole.",
+        "parameters": {"type": "object", "properties": {
+            "title": {"type": "string", "description": "Event ka naam"},
+            "date": {"type": "string", "description": "Date/time, jaise '2026-06-20 17:00'"}},
+            "required": ["title", "date"]}}},
 ]
 
 # ---------- agent ----------
@@ -1081,4 +1109,7 @@ gr.ChatInterface(
     agent_respond,
     textbox=gr.MultimodalTextbox(sources=["upload", "microphone"]),
     title="Akhil ka Agentic AI",
-).launch()
+).launch(
+    server_name="0.0.0.0",
+    server_port=7860
+)
