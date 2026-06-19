@@ -1,37 +1,73 @@
-import tempfile
-import asyncio
-import urllib.parse
-import threading
-import getpass
-import requests
-from bs4 import BeautifulSoup
-import json
+"""
+=====================================================================================
+ SpaceVerse AI  —  Multi-Agent AI Assistant (Akhil's Assistant)
+=====================================================================================
+ A Gradio-based agentic AI app powered by Groq (LLaMA 3.3 70B) with tools, RAG,
+ long-term memory, multi-agent routing, and multi-modal (text/image/audio) support.
+
+ FILE STRUCTURE (use Ctrl+F on the section banners to jump around):
+   1. IMPORTS
+   2. CONFIG & CLIENT
+   3. PROMPTS            (system prompt + specialist agent prompts)
+   4. TOOL FUNCTIONS
+        4.1 Basic utilities
+        4.2 Web, search & research
+        4.3 Finance & weather
+        4.4 Media (image / audio / vision / TTS)
+        4.5 YouTube & code execution
+        4.6 Documents (create / convert / presentation)
+        4.7 Resume & job tools
+        4.8 Productivity (email / calendar / meeting / github)
+        4.9 Planning & multi-agent helpers
+   5. RAG SYSTEM         (FAISS index + document indexing)
+   6. LONG-TERM MEMORY
+   7. MULTI-AGENT ROUTER
+   8. TOOL REGISTRY & SCHEMA
+   9. MAIN AGENT LOOP    (agent_respond)
+   10. GRADIO UI / LAUNCH
+=====================================================================================
+"""
+
+# =====================================================================================
+# 1. IMPORTS
+# =====================================================================================
+
+# ---- Standard library ----
 import os
 import re
+import io
+import json
+import time
+import base64
 import pickle
-import gradio as gr
-from sentence_transformers import SentenceTransformer
+import asyncio
+import tempfile
+import threading
+import contextlib
+import urllib.parse
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+# ---- Third-party (core) ----
+import requests
 import numpy as np
 import pandas as pd
 import faiss
-from duckduckgo_search import DDGS
+import gradio as gr
+import sympy as sp
+import fitz  # PyMuPDF
+from bs4 import BeautifulSoup
 from groq import Groq
 from pypdf import PdfReader
 from docx import Document
 from fpdf import FPDF
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from pptx import Presentation
+from sentence_transformers import SentenceTransformer
+from duckduckgo_search import DDGS
 from youtube_transcript_api import YouTubeTranscriptApi
 import edge_tts
-import time
-import io
-import contextlib
-import base64
-import sympy as sp
-import fitz
-from pptx import Presentation
 
-# Bhaari/optional packages - agar install nahi hain to file phir bhi chale (tool error dega)
+# ---- Optional / heavy packages (app still runs if these are missing) ----
 try:
     from github import Github
 except Exception:
@@ -45,15 +81,25 @@ try:
 except Exception:
     yagmail = None
 
-# >>> Key getpass se. Code me hardcode MAT karo. Purani leaked key REVOKE karo. <<<
-client = Groq(
-    api_key=os.getenv("GROQ_API_KEY")
-)
+
+# =====================================================================================
+# 2. CONFIG & CLIENT
+# =====================================================================================
+# NOTE: Never hardcode API keys. Set them as environment variables before running:
+#   GROQ_API_KEY, GITHUB_TOKEN, EMAIL_ID, EMAIL_PASSWORD
+# If an old key was ever leaked, REVOKE it immediately.
+
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 MODEL = "llama-3.3-70b-versatile"
 DEBUG = False
+MAX_TOOL_TURNS = 29
 
 
-# ---------- SYSTEM PROMPT ----------
+# =====================================================================================
+# 3. PROMPTS
+# =====================================================================================
+
+# ---- 3.1 Main system prompt ----
 SYSTEM_PROMPT = """
 You are 'Akhil's Assistant' - a capable, proactive AI agent that solves tasks end-to-end, accurately and clearly.
 
@@ -77,32 +123,165 @@ You are 'Akhil's Assistant' - a capable, proactive AI agent that solves tasks en
 - Always reply in the SAME language the user uses (Hindi -> Hindi, Hinglish -> Hinglish, English -> English).
 - Warm, clear, concise. No filler, no hype.
 
+# CONTEXT AWARENESS (translate / explain / summarize "this")
+- If the user says "translate", "translate this", "translate in <language>", "explain this", "summarize this",
+  "shorten this", or "elaborate this" WITHOUT providing new text, use the most recent assistant response as the input.
+- Support translation into any language the user requests.
+
 # HONESTY
 - Never invent facts, links, sources, or data. If unsure, say so plainly.
 """
 
-# ---------- Multi-agent specialist prompts ----------
+# ---- 3.2 Specialist (multi-agent) prompts ----
 AGENT_PROMPTS = {
-    "coding":   "MODE: Coding specialist. Saaf, complete, runnable code do. Zaroorat ho to run_python se test karo.",
-    "math":     "MODE: Math specialist. Step-by-step solve karo, aur exact hisaab ke liye calculator tool use karo.",
-    "research": "MODE: Research specialist. web_search/deep_research use karo, kai sources compare karo, source URLs do.",
-    "writing":  "MODE: Writing specialist. Saaf, well-structured likhawat user ki zaroorat ke hisaab se.",
-    "analyst":  "You are a professional data analyst. Analyze data and provide insights.",
-    "meeting":  "Expert meeting assistant.",
-    "email":    "Professional email assistant.",
-    "planner":  "You are an expert strategic planner. Create detailed plans.",
-    "reviewer": "You are an expert reviewer. Find mistakes and improve responses.",
-    "executor": "You are an autonomous task execution agent. Create plans and execute workflows.",
-    "team":     "You are a coordinator managing multiple specialist AI agents.",
+    "coding": """
+You are a Senior Software Engineer.
+Write clean, optimized, secure, and production-ready code.
+Debug errors, explain logic, suggest improvements,
+and provide complete runnable solutions.
+""",
+    "math": """
+You are an Expert Mathematician.
+Solve problems step-by-step.
+Show formulas and calculations clearly.
+Verify answers before responding.
+""",
+    "research": """
+You are a Professional Research Analyst.
+Gather information from multiple sources.
+Compare findings, identify trends,
+and provide detailed reports with references.
+""",
+    "writing": """
+You are an Expert Content Writer.
+Create professional, well-structured,
+clear, and engaging content.
+Adapt writing style according to user requirements.
+""",
+    "analyst": """
+You are a Data Analytics Specialist.
+Analyze data, identify patterns,
+generate insights, and provide recommendations.
+Present findings clearly and professionally.
+""",
+    "meeting": """
+You are a Meeting Intelligence Agent.
+Generate meeting summaries,
+key decisions, action items,
+and follow-up recommendations.
+""",
+    "email": """
+You are a Professional Email Assistant.
+Write clear, concise,
+professional, and effective emails.
+Improve tone, grammar, and clarity.
+""",
+    "planner": """
+You are a Strategic Planning Agent.
+Break complex goals into actionable steps.
+Create roadmaps, execution plans,
+timelines, and milestones.
+""",
+    "reviewer": """
+You are a Quality Assurance Reviewer.
+Check responses for:
+- Mistakes
+- Missing information
+- Logical issues
+- Hallucinations
+- Weak explanations
+
+Improve and refine the final answer.
+""",
+    "executor": """
+You are an Autonomous Execution Agent.
+Create plans, organize workflows,
+and execute tasks systematically.
+Focus on practical completion of objectives.
+""",
+    "team": """
+You are a Multi-Agent Coordinator.
+Assign tasks to specialist agents,
+combine outputs,
+resolve conflicts,
+and generate the best final response.
+""",
+    "job": """
+You are a Fake Job Detection Specialist.
+
+Responsibilities:
+- Analyze job postings
+- Detect scam patterns
+- Evaluate hiring credibility
+- Verify company legitimacy
+- Assess salary realism
+- Generate risk scores
+
+Check for:
+- Registration fees
+- Upfront payments
+- Telegram recruitment
+- WhatsApp-only hiring
+- Gmail/Yahoo email addresses
+- Unrealistic salary offers
+- Missing company details
+- Fake urgency tactics
+- Suspicious interview processes
+
+Output Format:
+
+Risk Score: XX/100
+
+Risk Level:
+Low / Medium / High
+
+Positive Indicators:
+- ...
+
+Red Flags:
+- ...
+
+Final Verdict:
+Safe / Suspicious / Likely Scam
+
+Recommended Action:
+...
+""",
+    "autopilot": """
+You are SpaceVerse Autopilot - the default autonomous agent.
+
+Understand the user's real objective first.
+Automatically decide which specialist skills, tools, and steps are needed - NEVER ask the user which tool to use.
+Make a short internal plan, then act: call the right tools in sequence and combine everything into ONE clear, final answer.
+
+You can draw on these specialist styles as needed:
+- coding, math, research, writing, analyst
+- planner, executor, reviewer
+- email, meeting, team, job (fake-job detection)
+
+Pick the best combination automatically. Reply in the user's language.
+""",
 }
 
-# ---------- TOOL FUNCTIONS ----------
+
+# =====================================================================================
+# 4. TOOL FUNCTIONS
+# =====================================================================================
+
+# -------------------------------------------------------------------------------------
+# 4.1 Basic utilities
+# -------------------------------------------------------------------------------------
 def calculator(expression):
     return str(sp.sympify(expression))
+
 
 def get_current_time():
     return datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S")
 
+
+# -------------------------------------------------------------------------------------
+# 4.2 Web, search & research
+# -------------------------------------------------------------------------------------
 def web_search(query):
     results = DDGS().text(query, max_results=5)
     if not results:
@@ -112,6 +291,95 @@ def web_search(query):
         out.append(f"- {r.get('title','')}\n  URL: {r.get('href','')}\n  {r.get('body','')}")
     return "\n\n".join(out)
 
+
+def read_webpage(url):
+    try:
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header"]):
+            tag.decompose()
+        return soup.get_text(separator=" ", strip=True)[:3000]
+    except Exception as e:
+        return f"Page nahi padh paaya: {e}"
+
+
+def deep_research(topic):
+    queries = [topic, f"{topic} latest", f"{topic} explained in detail"]
+    seen, picked = set(), []
+    for q in queries:
+        try:
+            results = DDGS().text(q, max_results=4)
+        except Exception:
+            results = []
+        for r in results:
+            url = r.get("href", "")
+            if url and url not in seen:
+                seen.add(url)
+                picked.append((r.get("title", ""), url, r.get("body", "")))
+        if len(picked) >= 5:
+            break
+    if not picked:
+        return "Koi research result nahi mila."
+    briefs = []
+    for title, url, snippet in picked[:4]:
+        page = read_webpage(url)
+        page = page[:900] if isinstance(page, str) else ""
+        briefs.append(f"SOURCE: {title}\nURL: {url}\n{snippet}\nPAGE: {page}")
+    return "\n\n---\n\n".join(briefs)
+
+
+def advanced_research(query):
+    research = deep_research(query)
+    prompt = f"""
+    Research Results:
+
+    {research}
+
+    Create:
+    1. Executive Summary
+    2. Key Findings
+    3. Risks
+    4. Recommendations
+    """
+    response = client.chat.completions.create(
+        model=MODEL, messages=[{"role": "user", "content": prompt}])
+    return response.choices[0].message.content
+
+
+def open_website(url):
+    if sync_playwright is None:
+        return "Playwright install nahi hai."
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url)
+            title = page.title()
+            browser.close()
+            return title
+    except Exception as e:
+        return str(e)
+
+
+def browser_search(url):
+    if sync_playwright is None:
+        return "Playwright install nahi hai."
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url)
+            title = page.title()
+            content = page.content()
+            browser.close()
+            return f"Title: {title}\n\n{content[:3000]}"
+    except Exception as e:
+        return str(e)
+
+
+# -------------------------------------------------------------------------------------
+# 4.3 Finance & weather
+# -------------------------------------------------------------------------------------
 def get_weather(city):
     try:
         geo = requests.get("https://geocoding-api.open-meteo.com/v1/search",
@@ -130,6 +398,7 @@ def get_weather(city):
     except Exception as e:
         return f"Mausam nahi mila: {e}"
 
+
 def convert_currency(amount, from_currency, to_currency):
     try:
         r = requests.get("https://api.frankfurter.app/latest",
@@ -143,6 +412,84 @@ def convert_currency(amount, from_currency, to_currency):
     except Exception as e:
         return f"Currency error: {e}"
 
+
+# -------------------------------------------------------------------------------------
+# 4.4 Media (image / audio / vision / TTS)
+# -------------------------------------------------------------------------------------
+def generate_image(prompt):
+    try:
+        clean = urllib.parse.quote(prompt.strip())
+        url = f"https://image.pollinations.ai/prompt/{clean}?width=1024&height=1024&nologo=true&model=flux"
+        resp = requests.get(url, timeout=60)
+        resp.raise_for_status()
+        path = tempfile.NamedTemporaryFile(delete=False, suffix=".png").name
+        with open(path, "wb") as f:
+            f.write(resp.content)
+        return path
+    except Exception as e:
+        return f"Image generate nahi ho payi: {e}"
+
+
+def analyze_image(filepath, question):
+    with open(filepath, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    response = client.chat.completions.create(
+        model="meta-llama/llama-4-scout-17b-16e-instruct",
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": question or "Is image mein kya hai? Detail mein batao."},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+            ],
+        }],
+        max_tokens=1024,
+    )
+    return response.choices[0].message.content
+
+
+def transcribe_audio(filepath):
+    with open(filepath, "rb") as f:
+        result = client.audio.transcriptions.create(model="whisper-large-v3-turbo", file=f)
+    return result.text
+
+
+def text_to_speech(text, voice="hi-IN-SwaraNeural"):
+    clean = (text or "").strip()
+    if not clean:
+        return None
+    path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
+    err = {}
+
+    def _run():
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(edge_tts.Communicate(clean[:1000], voice).save(path))
+            loop.close()
+        except Exception as e:
+            err["e"] = e
+
+    t = threading.Thread(target=_run)
+    t.start()
+    t.join()
+    if err:
+        print("TTS error:", err["e"])
+        return None
+    return path
+
+
+def voice_chat(audio_file):
+    text = transcribe_audio(audio_file)
+    response = client.chat.completions.create(
+        model=MODEL, messages=[{"role": "user", "content": text}])
+    answer = response.choices[0].message.content
+    audio = text_to_speech(answer)
+    return {"transcript": text, "answer": answer, "audio": audio}
+
+
+# -------------------------------------------------------------------------------------
+# 4.5 YouTube & code execution
+# -------------------------------------------------------------------------------------
 def youtube_summary(url):
     try:
         if "v=" in url:
@@ -161,63 +508,6 @@ def youtube_summary(url):
     except Exception as e:
         return f"Transcript nahi mila: {e}"
 
-def transcribe_audio(filepath):
-    with open(filepath, "rb") as f:
-        result = client.audio.transcriptions.create(model="whisper-large-v3-turbo", file=f)
-    return result.text
-
-def generate_image(prompt):
-    try:
-        clean = urllib.parse.quote(prompt.strip())
-        url = f"https://image.pollinations.ai/prompt/{clean}?width=1024&height=1024&nologo=true&model=flux"
-        resp = requests.get(url, timeout=60)
-        resp.raise_for_status()
-        path = tempfile.NamedTemporaryFile(delete=False, suffix=".png").name
-        with open(path, "wb") as f:
-            f.write(resp.content)
-        return path
-    except Exception as e:
-        return f"Image generate nahi ho payi: {e}"
-
-def text_to_speech(text, voice="hi-IN-SwaraNeural"):
-    clean = (text or "").strip()
-    if not clean:
-        return None
-    path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
-    err = {}
-    def _run():
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(edge_tts.Communicate(clean[:1000], voice).save(path))
-            loop.close()
-        except Exception as e:
-            err["e"] = e
-    t = threading.Thread(target=_run)
-    t.start()
-    t.join()
-    if err:
-        print("TTS error:", err["e"])
-        return None
-    return path
-
-def voice_chat(audio_file):
-    text = transcribe_audio(audio_file)
-    response = client.chat.completions.create(
-        model=MODEL, messages=[{"role": "user", "content": text}])
-    answer = response.choices[0].message.content
-    audio = text_to_speech(answer)
-    return {"transcript": text, "answer": answer, "audio": audio}
-
-def read_webpage(url):
-    try:
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header"]):
-            tag.decompose()
-        return soup.get_text(separator=" ", strip=True)[:3000]
-    except Exception as e:
-        return f"Page nahi padh paaya: {e}"
 
 def run_python(code):
     output = io.StringIO()
@@ -229,6 +519,10 @@ def run_python(code):
     except Exception as e:
         return f"Error: {e}"
 
+
+# -------------------------------------------------------------------------------------
+# 4.6 Documents (create / convert / presentation)
+# -------------------------------------------------------------------------------------
 def create_document(content, filetype="pdf", filename="document"):
     try:
         ftype = (filetype or "pdf").lower().lstrip(".")
@@ -258,15 +552,12 @@ def create_document(content, filetype="pdf", filename="document"):
     except Exception as e:
         return f"Document banane me error: {e}"
 
-def add_event(title, date):
-    with open("calendar_events.txt", "a", encoding="utf-8") as f:
-        f.write(f"{date} | {title}\n")
-    return "Event added."
 
 def convert_last_document(filetype="docx", filename="converted"):
     if not last_doc_text.strip():
         return "Koi document upload nahi hua jise convert kar saku."
     return create_document(last_doc_text, filetype, filename)
+
 
 def create_presentation(slides_json, filename="presentation"):
     try:
@@ -292,6 +583,10 @@ def create_presentation(slides_json, filename="presentation"):
     except Exception as e:
         return f"Presentation banane me error: {e}"
 
+
+# -------------------------------------------------------------------------------------
+# 4.7 Resume & job tools
+# -------------------------------------------------------------------------------------
 def screen_resume(job_description):
     if not last_doc_text.strip():
         return "Pehle ek resume (PDF/docx) upload karo, phir screen karunga."
@@ -318,92 +613,44 @@ Reply in the user's language (Hindi/Hinglish if they used it)."""
     except Exception as e:
         return f"Screening error: {e}"
 
-def analyze_image(filepath, question):
-    with open(filepath, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode()
-    response = client.chat.completions.create(
-        model="meta-llama/llama-4-scout-17b-16e-instruct",
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": question or "Is image mein kya hai? Detail mein batao."},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-            ],
-        }],
-        max_tokens=1024,
-    )
-    return response.choices[0].message.content
 
-def deep_research(topic):
-    queries = [topic, f"{topic} latest", f"{topic} explained in detail"]
-    seen, picked = set(), []
-    for q in queries:
-        try:
-            results = DDGS().text(q, max_results=4)
-        except Exception:
-            results = []
-        for r in results:
-            url = r.get("href", "")
-            if url and url not in seen:
-                seen.add(url)
-                picked.append((r.get("title", ""), url, r.get("body", "")))
-        if len(picked) >= 5:
-            break
-    if not picked:
-        return "Koi research result nahi mila."
-    briefs = []
-    for title, url, snippet in picked[:4]:
-        page = read_webpage(url)
-        page = page[:900] if isinstance(page, str) else ""
-        briefs.append(f"SOURCE: {title}\nURL: {url}\n{snippet}\nPAGE: {page}")
-    return "\n\n---\n\n".join(briefs)
-
-def open_website(url):
-    if sync_playwright is None:
-        return "Playwright install nahi hai."
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(url)
-            title = page.title()
-            browser.close()
-            return title
-    except Exception as e:
-        return str(e)
-
-def browser_search(url):
-    if sync_playwright is None:
-        return "Playwright install nahi hai."
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(url)
-            title = page.title()
-            content = page.content()
-            browser.close()
-            return f"Title: {title}\n\n{content[:3000]}"
-    except Exception as e:
-        return str(e)
-
-def advanced_research(query):
-    research = deep_research(query)
+def fake_job_detector(job_text):
     prompt = f"""
-    Research Results:
+You are an expert job fraud detection analyst.
 
-    {research}
+Analyze this job posting:
 
-    Create:
-    1. Executive Summary
-    2. Key Findings
-    3. Risks
-    4. Recommendations
-    """
+{job_text}
+
+Check:
+
+1. Scam Score (0-100)
+2. Risk Level (Low/Medium/High)
+3. Warning Signs
+4. Positive Signs
+5. Final Verdict
+
+Look for:
+- Registration fees
+- Telegram hiring
+- WhatsApp only hiring
+- Gmail/Yahoo email
+- Unrealistic salary
+- No company information
+- Fake urgency
+
+Return structured report.
+"""
     response = client.chat.completions.create(
-        model=MODEL, messages=[{"role": "user", "content": prompt}])
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2)
     return response.choices[0].message.content
 
+
+# -------------------------------------------------------------------------------------
+# 4.8 Productivity (email / calendar / meeting / github)
+# -------------------------------------------------------------------------------------
 def send_email(to, subject, body):
     try:
         yag = yagmail.SMTP(os.getenv("EMAIL_ID"), os.getenv("EMAIL_PASSWORD"))
@@ -411,6 +658,13 @@ def send_email(to, subject, body):
         return "Email sent successfully."
     except Exception as e:
         return str(e)
+
+
+def add_event(title, date):
+    with open("calendar_events.txt", "a", encoding="utf-8") as f:
+        f.write(f"{date} | {title}\n")
+    return "Event added."
+
 
 def summarize_meeting(text):
     prompt = f"""
@@ -427,7 +681,10 @@ def summarize_meeting(text):
         model=MODEL, messages=[{"role": "user", "content": prompt}])
     return response.choices[0].message.content
 
+
 def github_repo_info(repo_name):
+    if Github is None:
+        return "PyGithub install nahi hai."
     try:
         g = Github(os.getenv("GITHUB_TOKEN"))
         repo = g.get_repo(repo_name)
@@ -437,6 +694,10 @@ def github_repo_info(repo_name):
     except Exception as e:
         return str(e)
 
+
+# -------------------------------------------------------------------------------------
+# 4.9 Planning & multi-agent helpers
+# -------------------------------------------------------------------------------------
 def create_plan(task):
     prompt = f"""
     Break this task into steps:
@@ -449,9 +710,16 @@ def create_plan(task):
         model=MODEL, messages=[{"role": "user", "content": prompt}])
     return response.choices[0].message.content
 
+
 def execute_workflow(task):
     plan = create_plan(task)
     return f"Task:\n{task}\n\nPlan:\n{plan}"
+
+
+def autonomous_task(task):
+    plan = create_plan(task)
+    return f"Task:\n{task}\n\nExecution Plan:\n{plan}"
+
 
 def review_answer(question, answer):
     prompt = f"""
@@ -469,9 +737,6 @@ def review_answer(question, answer):
         model=MODEL, messages=[{"role": "user", "content": prompt}])
     return response.choices[0].message.content
 
-def autonomous_task(task):
-    plan = create_plan(task)
-    return f"Task:\n{task}\n\nExecution Plan:\n{plan}"
 
 def team_agent(task):
     plan = create_plan(task)
@@ -494,11 +759,20 @@ RESEARCH:
     except Exception as e:
         return f"Team agent error: {e}"
 
-# ---------- RAG (FAISS: multi-doc + persistent) ----------
+
+# =====================================================================================
+# 5. RAG SYSTEM  (FAISS: multi-doc + persistent)
+# =====================================================================================
+
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 EMBED_DIM = 384
 RAG_INDEX_PATH = "rag.index"
 RAG_CHUNKS_PATH = "rag_chunks.pkl"
+
+# ---- Session/runtime state (shared globals) ----
+indexed_docs = []      # names of currently indexed documents
+last_doc_text = ""     # full text of the most recently uploaded document
+
 
 def chunk_text(text, size=500, overlap=100):
     chunks = []
@@ -508,6 +782,8 @@ def chunk_text(text, size=500, overlap=100):
         i += size - overlap
     return chunks
 
+
+# ---- Load existing index from disk, or start fresh ----
 if os.path.exists(RAG_INDEX_PATH) and os.path.exists(RAG_CHUNKS_PATH):
     faiss_index = faiss.read_index(RAG_INDEX_PATH)
     with open(RAG_CHUNKS_PATH, "rb") as f:
@@ -516,8 +792,6 @@ else:
     faiss_index = faiss.IndexFlatIP(EMBED_DIM)
     doc_chunks = []
 
-indexed_docs = []
-last_doc_text = ""
 
 def reset_rag():
     global faiss_index, doc_chunks
@@ -527,6 +801,7 @@ def reset_rag():
     for p in (RAG_INDEX_PATH, RAG_CHUNKS_PATH):
         if os.path.exists(p):
             os.remove(p)
+
 
 def _add_to_rag(text):
     global doc_chunks
@@ -541,6 +816,8 @@ def _add_to_rag(text):
     with open(RAG_CHUNKS_PATH, "wb") as f:
         pickle.dump(doc_chunks, f)
 
+
+# ---- Document readers / indexers ----
 def read_scanned_pdf(filepath, max_pages=5):
     out = []
     doc = fitz.open(filepath)
@@ -551,11 +828,12 @@ def read_scanned_pdf(filepath, max_pages=5):
         img_path = tempfile.NamedTemporaryFile(delete=False, suffix=".png").name
         pix.save(img_path)
         try:
-            out.append(analyze_image(img_path, "Is page ka saara text jaisा likha hai waise nikaalo."))
+            out.append(analyze_image(img_path, "Is page ka saara text jaisa likha hai waise nikaalo."))
         except Exception as e:
             out.append(f"(page {i+1} padhne me error: {e})")
     doc.close()
     return "\n\n".join(out)
+
 
 def index_pdf(filepath):
     global last_doc_text
@@ -566,17 +844,20 @@ def index_pdf(filepath):
     last_doc_text = text
     _add_to_rag(text)
 
+
 def index_docx(filepath):
     global last_doc_text
     text = "\n".join(p.text for p in Document(filepath).paragraphs)
     last_doc_text = text
     _add_to_rag(text)
 
+
 def index_excel(filepath):
     global last_doc_text
     text = pd.read_excel(filepath).to_string()
     last_doc_text = text
     _add_to_rag(text)
+
 
 def analyze_excel(filepath):
     global last_doc_text
@@ -587,6 +868,8 @@ def analyze_excel(filepath):
     return {"rows": len(df), "columns": len(df.columns),
             "column_names": list(df.columns), "status": "Added to RAG"}
 
+
+# ---- Retrieval ----
 def retrieve(query, k=5):
     if faiss_index.ntotal == 0 or not query:
         return ""
@@ -596,80 +879,93 @@ def retrieve(query, k=5):
     scores, idx = faiss_index.search(q, k)
     return "\n\n".join(doc_chunks[i] for i in idx[0] if 0 <= i < len(doc_chunks))
 
+
 def knowledge_search(query):
     docs = retrieve(query)
     if docs:
         return docs
     return "No relevant knowledge found."
 
-# ---------- Long-term memory ----------
+
+# =====================================================================================
+# 6. LONG-TERM MEMORY
+# =====================================================================================
+
 MEMORY_FILE = "memory.json"
+
 if os.path.exists(MEMORY_FILE):
     with open(MEMORY_FILE, "r", encoding="utf-8") as f:
         user_memory = json.load(f)
 else:
     user_memory = {"name": "", "interests": [], "projects": [], "preferences": [], "facts": []}
 
+# Ensure all expected keys exist (back-compat for older memory files)
 for _k, _default in (("name", ""), ("interests", []), ("projects", []),
                      ("preferences", []), ("facts", [])):
     if _k not in user_memory:
         user_memory[_k] = _default
 
+
 def _save_memory():
     with open(MEMORY_FILE, "w", encoding="utf-8") as f:
         json.dump(user_memory, f, ensure_ascii=False, indent=2)
+
 
 def search_memory(query):
     facts = user_memory.get("facts", [])
     hits = [f for f in facts if (query or "").lower() in f.lower()]
     return "\n".join(hits) if hits else "Memory me kuch related nahi mila."
 
+
 def smart_memory_search(query):
-
     query = (query or "").lower()
-
     results = []
-
     for key, value in user_memory.items():
-
         if query in str(value).lower():
-
-            results.append(
-                f"{key}: {value}"
-            )
-
+            results.append(f"{key}: {value}")
     if results:
         return "\n".join(results)
-
     return "Memory me kuch nahi mila."
 
-# ---------- Multi-agent router ----------
+
+# =====================================================================================
+# 7. MULTI-AGENT ROUTER
+# =====================================================================================
 def route_agent(user_text):
     txt = (user_text or "").lower()
-    if any(x in txt for x in ["python","code","program","bug","coding","algorithm"]):
+    if any(x in txt for x in ["python", "code", "program", "bug", "coding", "algorithm"]):
         return "coding"
-    if any(x in txt for x in ["research","analyze","compare","study","report","investigate"]):
+    if any(x in txt for x in ["research", "analyze", "compare", "study", "report", "investigate"]):
         return "research"
-    if any(x in txt for x in ["math","solve","equation","calculate","ganit","integral"]):
+    if any(x in txt for x in ["math", "solve", "equation", "calculate", "ganit", "integral"]):
         return "math"
-    if any(x in txt for x in ["teach","explain","tutorial","learn"]):
+    if any(x in txt for x in ["teach", "explain", "tutorial", "learn"]):
         return "planner"
-    if any(x in txt for x in ["email","essay","article","blog"]):
+    if any(x in txt for x in ["email", "essay", "article", "blog"]):
         return "writing"
-    if any(x in txt for x in ["excel","csv","dashboard","analytics","data"]):
+    if any(x in txt for x in ["excel", "csv", "dashboard", "analytics", "data"]):
         return "analyst"
-    if any(x in txt for x in ["meeting","minutes","transcript"]):
+    if any(x in txt for x in ["meeting", "minutes", "transcript"]):
         return "meeting"
     if any(x in txt for x in ["mail"]):
         return "email"
-    if any(x in txt for x in ["calendar","schedule","reminder"]):
+    if any(x in txt for x in ["calendar", "schedule", "reminder"]):
         return "planner"
-    if any(x in txt for x in ["automation","workflow","execute","complete task"]):
+    if any(x in txt for x in ["automation", "workflow", "execute", "complete task"]):
         return "executor"
-    if any(x in txt for x in ["team","multiple agents","collaborate"]):
+    if any(x in txt for x in ["team", "multiple agents", "collaborate"]):
         return "team"
-    return "general"
-# ---------- TOOL REGISTRY (sab functions yahan tak define ho chuke) ----------
+    if any(x in txt for x in ["job scam", "fake job", "job verification", "verify job", "job fraud"]):
+        return "job"
+    # No specific agent matched -> use Autopilot (autonomous default)
+    return "autopilot"
+
+
+# =====================================================================================
+# 8. TOOL REGISTRY & SCHEMA
+# =====================================================================================
+
+# ---- 8.1 Name -> function map (used to actually run a tool) ----
 TOOL_FUNCTIONS = {
     "calculator": calculator,
     "get_current_time": get_current_time,
@@ -704,9 +1000,10 @@ TOOL_FUNCTIONS = {
     "smart_memory_search": smart_memory_search,
     "team_agent": team_agent,
     "knowledge_search": knowledge_search,
+    "fake_job_detector": fake_job_detector,
 }
 
-# ---------- TOOLS MENU ----------
+# ---- 8.2 Tool schema sent to the model (descriptions guide when to call each) ----
 tools = [
     {"type": "function", "function": {
         "name": "calculator",
@@ -883,6 +1180,13 @@ tools = [
             "text": {"type": "string", "description": "Meeting ka transcript text"}}, "required": ["text"]}}},
 
     {"type": "function", "function": {
+        "name": "fake_job_detector",
+        "description": "Analyze job postings and detect scams or fake jobs.",
+        "parameters": {"type": "object", "properties": {
+            "job_text": {"type": "string", "description": "Job description text"}},
+            "required": ["job_text"]}}},
+
+    {"type": "function", "function": {
         "name": "add_event",
         "description": "Calendar event save karta hai. Jab user koi reminder/event/schedule add karne ko bole.",
         "parameters": {"type": "object", "properties": {
@@ -891,17 +1195,20 @@ tools = [
             "required": ["title", "date"]}}},
 ]
 
-# ---------- agent ----------
-MAX_TOOL_TURNS = 6
 
+# =====================================================================================
+# 9. MAIN AGENT LOOP
+# =====================================================================================
 def agent_respond(message, history):
+    # ---- 9.1 Parse incoming message (text + files) ----
     if isinstance(message, dict):
         user_text = message.get("text", "")
         files = message.get("files", [])
     else:
         user_text, files = message, []
 
-    # clear memory command
+    # ---- 9.2 Special commands ----
+    # Clear memory
     if (user_text or "").strip().lower() == "clear memory":
         user_memory.clear()
         user_memory.update({"name": "", "interests": [], "projects": [], "preferences": [], "facts": []})
@@ -909,12 +1216,39 @@ def agent_respond(message, history):
         yield "Memory cleared."
         return
 
-    # clear docs command
-    if (user_text or "").strip().lower() in ("clear docs", "reset docs", "naye docs", "documents clear", "folder clear"):
+    # Clear documents (RAG)
+    if (user_text or "").strip().lower() in ("clear docs", "reset docs", "naye docs",
+                                             "documents clear", "folder clear"):
         reset_rag()
         yield "Saare documents hata diye. Ab naya folder/PDF upload karo."
         return
 
+    # ---- 9.3 Translation shortcut ----
+    # Agar user "translate"/"translate in <lang>" bole BINA naya text diye,
+    # to last assistant response ko translate karne ke liye use karo.
+    translation_keywords = [
+        "translate", "translation", "translate into", "translate to",
+        "hindi me", "english me", "spanish me", "french me", "german me",
+        "chinese me", "japanese me", "arabic me", "russian me", "korean me", "urdu me",
+    ]
+    if user_text and any(k in user_text.lower() for k in translation_keywords):
+        last_assistant = ""
+        for h in reversed(history):
+            if isinstance(h, dict) and h.get("role") == "assistant":
+                last_assistant = h.get("content", "")
+                break
+        if last_assistant:
+            user_text = f"""Translate the following text according to the user's request.
+
+Previous Assistant Response:
+{last_assistant}
+
+Translation Request:
+{user_text}
+
+Return only the translated text."""
+
+    # ---- 9.4 Handle uploaded files ----
     image_path = None
     transcript = None
     for f in files:
@@ -931,7 +1265,7 @@ def agent_respond(message, history):
         elif low_f.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
             image_path = f
 
-    # Image upload -> vision
+    # ---- 9.5 Image upload -> vision answer ----
     if image_path:
         answer = analyze_image(image_path, user_text)
         partial = ""
@@ -947,7 +1281,7 @@ def agent_respond(message, history):
             ]
         return
 
-    # Text se nayi image
+    # ---- 9.6 Text -> generate a new image ----
     low = (user_text or "").lower()
     image_words = ["image", "picture", "photo", "tasveer", "wallpaper", "logo", "drawing"]
     make_words = ["banao", "bana do", "bana de", "generate", "create", "make", "draw", "design", "chahiye"]
@@ -963,21 +1297,22 @@ def agent_respond(message, history):
             yield f"Image generate nahi ho payi. {img_path}"
         return
 
-    # Messages history se
+    # ---- 9.7 Build the message list for the model ----
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if transcript:
         messages.append({"role": "system", "content": f"Audio Transcript:\n{transcript}"})
-    for h in history:
+    # Only send the last 8 messages of history (keeps each request small = fewer tokens)
+    for h in history[-8:]:
         if isinstance(h, dict) and isinstance(h.get("content"), str) and h["content"].strip():
             messages.append({"role": h["role"], "content": h["content"]})
 
-    # Multi-agent: specialist mode (safe .get so unknown key se crash na ho)
+    # Multi-agent specialist prompt (safe .get so unknown key se crash na ho)
     agent_type = route_agent(user_text)
     sp_prompt = AGENT_PROMPTS.get(agent_type)
     if sp_prompt:
         messages.append({"role": "system", "content": sp_prompt})
 
-    # RAG
+    # RAG context
     context = retrieve(user_text)
     if context:
         messages.append({"role": "system",
@@ -986,7 +1321,7 @@ def agent_respond(message, history):
         messages.append({"role": "system",
                          "content": f"Loaded documents ({len(indexed_docs)}): " + ", ".join(indexed_docs[-20:])})
 
-    # Auto memory extraction
+    # ---- 9.8 Auto memory extraction ----
     if "my name is" in low:
         try:
             user_memory["name"] = user_text.split("is", 1)[1].strip()
@@ -1026,7 +1361,7 @@ def agent_respond(message, history):
     messages.append({"role": "system",
                      "content": "Use this user memory when relevant; don't re-ask known info.\n" + profile})
 
-    # URL ho to page padho
+    # If the message has a URL, pre-load that page's text
     urls = re.findall(r"https?://\S+", user_text or "")
     if urls:
         messages.append({"role": "system",
@@ -1034,9 +1369,11 @@ def agent_respond(message, history):
 
     messages.append({"role": "user", "content": user_text or "(file dekho)"})
 
+    # ---- 9.9 Tool-calling loop ----
     generated_files = []
 
     for _ in range(MAX_TOOL_TURNS):
+        # Call the model (retry a few times on tool_use_failed)
         response = None
         for attempt in range(3):
             try:
@@ -1050,6 +1387,7 @@ def agent_respond(message, history):
                 yield f"API error: {e}\nThodi der baad dobara try karo."
                 return
 
+        # Fallback: try once without tools
         if response is None:
             try:
                 response = client.chat.completions.create(
@@ -1060,18 +1398,23 @@ def agent_respond(message, history):
 
         msg = response.choices[0].message
 
+        # No tool calls -> this is the final answer
         if not msg.tool_calls:
             answer = msg.content or ""
-            # Self-review (Level 5)
-            try:
-                answer = review_answer(user_text, answer)
-            except Exception:
-                pass
+            # NOTE: Self-review (review_answer) was disabled to save tokens -
+            # it made an EXTRA LLM call per response (doubling token usage).
+            # Re-enable below ONLY if you have spare quota:
+            #   try:
+            #       answer = review_answer(user_text, answer)
+            #   except Exception:
+            #       pass
+            # Stream the answer word-by-word
             partial = ""
             for word in answer.split(" "):
                 partial += word + " "
                 yield partial
                 time.sleep(0.02)
+            # Attach any generated files + a TTS audio reply
             out = [{"role": "assistant", "content": answer}]
             for fp in generated_files:
                 out.append({"role": "assistant", "content": {"path": fp}})
@@ -1082,7 +1425,8 @@ def agent_respond(message, history):
                 yield out
             return
 
-        yield "_(soch raha hoon...)_"
+        # Tool calls -> run each tool, append results, then loop again
+        yield "_(wait...)_"
         messages.append(msg)
         for tc in msg.tool_calls:
             fn = TOOL_FUNCTIONS.get(tc.function.name)
@@ -1096,20 +1440,25 @@ def agent_respond(message, history):
                     result = fn(**args)
                 except Exception as e:
                     result = f"Error: {e}"
-            if (tc.function.name in ("create_document", "generate_image", "convert_last_document", "create_presentation")
+            # File-producing tools: hand the file to the user
+            if (tc.function.name in ("create_document", "generate_image",
+                                     "convert_last_document", "create_presentation")
                     and isinstance(result, str) and os.path.exists(result)):
                 generated_files.append(result)
                 result = f"File ban gayi aur user ko de di: {os.path.basename(result)}"
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(result)})
 
+    # ---- 9.10 Loop exhausted (too many tool turns) ----
     yield "Bahut zyada tool calls ho gaye - yahin ruk raha hoon. Sawaal thoda simple karke poochho."
 
 
-gr.ChatInterface(
-    agent_respond,
-    textbox=gr.MultimodalTextbox(sources=["upload", "microphone"]),
-    title="Akhil ka Agentic AI",
-).launch(
-    server_name="0.0.0.0",
-    server_port=7860
-)
+# =====================================================================================
+# 10. GRADIO UI / LAUNCH
+# =====================================================================================
+if __name__ == "__main__":
+    gr.ChatInterface(
+        agent_respond,
+        textbox=gr.MultimodalTextbox(sources=["upload", "microphone"]),
+        title="🚀 SpaceVerse AI",
+        description="Multi-Agent AI Platform",
+    ).launch()
